@@ -1,0 +1,926 @@
+%% ============================================================================
+%%  QCM personnalisé : une page par élève, tirée d'une graine = son nom
+%%  À COMPILER AVEC  LuaLaTeX  (Overleaf : Menu > Compiler > LuaLaTeX)
+%%
+%%  0) UNE FOIS PAR LOT (classe / devoir) : créer la clé secrète  qcm_cle.txt
+%%     dans le même dossier que ce fichier :
+%%       - soit  texlua corriger.lua --nouvelle-cle "DS1-2026"   (Linux / macOS),
+%%       - soit dans l'application Android (Lots > Nouvelle clé > Partager),
+%%         puis coller la ligne  QCMKEY1:....  dans un fichier  qcm_cle.txt .
+%%     CE FICHIER EST SECRET : ne jamais le donner aux élèves ni le publier.
+%%  1) Modifier la liste des noms ci-dessous (séparés par des virgules).
+%%  2) Compiler  -> sujets élèves (une page par nom).
+%%     Chaque page porte un QR code CHIFFRÉ (ChaCha20-Poly1305) qui contient
+%%     le nom de l'élève et les 10 bonnes réponses. Sans la clé, le QR est
+%%     illisible et infalsifiable. Le bas de page (4 carrés noirs + grille +
+%%     QR) est lu par l'application Android : ne pas le modifier.
+%%     Ce fichier UNIQUE écrit aussi, à chaque compilation, trois scripts Lua :
+%%     qcm_chiffre.lua, qcm_generateur.lua et corriger.lua (même dossier).
+%%     Avec le texte lu dans le QR :  texlua corriger.lua "TEXTE_DU_QR" REPONSES
+%%     donne le nom et la note (mode d'emploi en tête de corriger.lua).
+%%  3) Pour le CORRIGÉ : décommenter la ligne  \def\PROF{}  ci-dessous
+%%     (réponses en vert + tableau récapitulatif à la fin), puis recompiler.
+%% ============================================================================
+%\def\PROF{}   % <-- décommenter pour obtenir le corrigé
+
+%% ----------------------------- LISTE DES NOMS -------------------------------
+%% Un nom par élément, séparés par des virgules (pas de virgule dans un nom).
+\newcommand{\ListeDesNoms}{%
+    Alain Térieur,
+    Sacha Touille,
+    Teddy Fissile,
+    Ella Bienduculo%
+}
+
+%% Graine « de sel » : changer ce texte (ex. DS2) donne une autre série de
+%% sujets pour les mêmes noms. Un même nom + un même sel = toujours le même sujet.
+\newcommand{\Graine}{DS1-2026}
+
+%% Fichier contenant la clé secrète du lot (voir étape 0 ci-dessus). La clé est
+%% aléatoire et indépendante de \Graine et des noms. Mêmes noms + même graine
+%% + même clé = exactement les mêmes feuilles (QR compris).
+\newcommand{\FichierCle}{qcm_cle.txt}
+%% ----------------------------------------------------------------------------
+
+\documentclass[12pt,a4paper]{article}
+\usepackage{amsmath,amssymb}
+\usepackage{fontspec}
+\setmainfont{TeX Gyre Heros}
+\usepackage{polyglossia}
+\setmainlanguage{french}
+\usepackage{unicode-math}
+\setmathfont{Latin Modern Math}
+\usepackage[margin=1.6cm,top=1.2cm,bottom=1.1cm]{geometry}
+\usepackage{enumitem,xcolor,array,etoolbox,longtable,qrcode}
+\definecolor{ok}{HTML}{1B6E3A}
+\definecolor{okbg}{HTML}{D9F2E1}
+\definecolor{qc}{HTML}{1F3A93}
+\setlength{\parindent}{0pt}
+\pagestyle{empty}
+
+\newcounter{qn}
+\newcounter{copie}
+\newcommand{\opt}[4]{\par\vspace{0.1em}\hspace{1.2em}\begin{tabular}{@{}p{0.46\linewidth}@{}p{0.46\linewidth}@{}}
+ \textbf{A.}~#1 & \textbf{B.}~#2\\[0.1em] \textbf{C.}~#3 & \textbf{D.}~#4 \end{tabular}\par}
+\newcommand{\question}[5]{%
+ \stepcounter{qn}\vspace{0.75em}%
+ {\bfseries\large\textcolor{qc}{Question~\theqn}}\hspace{0.6em}#1
+ \opt{#2}{#3}{#4}{#5}}
+
+%% ------------------- Chiffrement du QR (code Lua) ---------------------------
+\begin{filecontents*}[overwrite]{qcm_chiffre.lua}
+-- ============================================================================
+--  qcm_chiffre.lua : chiffrement authentifié du QR (ChaCha20-Poly1305, RFC 8439)
+--  Lua 5.3 ou plus (LuaTeX / texlua de TeX Live 2019 ou plus récent).
+--
+--  Texte du QR = base64url( 01 | id clé (3 o.) | nonce (12 o.) | chiffré | tag (16 o.) )
+--  Clair       = 3 octets (10 réponses, 2 bits chacune) puis le nom en UTF-8.
+--  Les 4 premiers octets (version + id de clé) sont authentifiés (AAD).
+--  Nonce : calculé à partir de la clé et du contenu (PRF = CBC-MAC sur le bloc
+--  ChaCha20) : même clé + même contenu = même QR ; contenu différent = nonce
+--  différent (sauf probabilité négligeable, 2^-96).
+-- ============================================================================
+local C = {}
+local pack, unpack = string.pack, string.unpack
+local M32 = 0xffffffff
+C.VERSION = 1
+
+local function rotl(x, n) return ((x << n) | (x >> (32 - n))) & M32 end
+
+-- Bloc ChaCha20 : clé 32 octets, compteur 32 bits, nonce 12 octets -> 64 octets
+function C.bloc(key, counter, nonce)
+  local k = { unpack("<I4I4I4I4I4I4I4I4", key) }
+  local n = { unpack("<I4I4I4", nonce) }
+  local s = { 0x61707865, 0x3320646e, 0x79622d32, 0x6b206574,
+              k[1], k[2], k[3], k[4], k[5], k[6], k[7], k[8],
+              counter & M32, n[1], n[2], n[3] }
+  local x = {}
+  for i = 1, 16 do x[i] = s[i] end
+  local function q(a, b, c, d)
+    x[a] = (x[a] + x[b]) & M32; x[d] = rotl(x[d] ~ x[a], 16)
+    x[c] = (x[c] + x[d]) & M32; x[b] = rotl(x[b] ~ x[c], 12)
+    x[a] = (x[a] + x[b]) & M32; x[d] = rotl(x[d] ~ x[a], 8)
+    x[c] = (x[c] + x[d]) & M32; x[b] = rotl(x[b] ~ x[c], 7)
+  end
+  for _ = 1, 10 do
+    q(1, 5, 9, 13); q(2, 6, 10, 14); q(3, 7, 11, 15); q(4, 8, 12, 16)
+    q(1, 6, 11, 16); q(2, 7, 12, 13); q(3, 8, 9, 14); q(4, 5, 10, 15)
+  end
+  for i = 1, 16 do x[i] = (x[i] + s[i]) & M32 end
+  return pack("<I4I4I4I4I4I4I4I4I4I4I4I4I4I4I4I4", table.unpack(x))
+end
+
+local function xor(a, b)                       -- a XOR b, sur la longueur de a
+  local t = {}
+  for i = 1, #a do t[i] = string.char(a:byte(i) ~ b:byte(i)) end
+  return table.concat(t)
+end
+
+-- Chiffrement de flux ChaCha20 (compteur initial donné)
+function C.chacha20(key, counter, nonce, data)
+  local out = {}
+  for i = 1, #data, 64 do
+    out[#out + 1] = xor(data:sub(i, i + 63), C.bloc(key, counter, nonce))
+    counter = counter + 1
+  end
+  return table.concat(out)
+end
+
+-- Poly1305 (clé à usage unique de 32 octets) -> tag de 16 octets
+function C.poly1305(key, msg)
+  local M26 = 0x3ffffff
+  local t0, t1, t2, t3 = unpack("<I4I4I4I4", key)
+  local r0 = t0 & 0x3ffffff
+  local r1 = ((t0 >> 26) | (t1 << 6)) & 0x3ffff03
+  local r2 = ((t1 >> 20) | (t2 << 12)) & 0x3ffc0ff
+  local r3 = ((t2 >> 14) | (t3 << 18)) & 0x3f03fff
+  local r4 = (t3 >> 8) & 0x00fffff
+  local s1, s2, s3, s4 = r1 * 5, r2 * 5, r3 * 5, r4 * 5
+  local h0, h1, h2, h3, h4 = 0, 0, 0, 0, 0
+  for i = 1, #msg, 16 do
+    local blk = msg:sub(i, i + 15)
+    local hibit = 1 << 24
+    if #blk < 16 then
+      blk = blk .. "\1" .. string.rep("\0", 15 - #blk)
+      hibit = 0
+    end
+    local m0, m1, m2, m3 = unpack("<I4I4I4I4", blk)
+    h0 = h0 + (m0 & M26)
+    h1 = h1 + (((m0 >> 26) | (m1 << 6)) & M26)
+    h2 = h2 + (((m1 >> 20) | (m2 << 12)) & M26)
+    h3 = h3 + (((m2 >> 14) | (m3 << 18)) & M26)
+    h4 = h4 + ((m3 >> 8) | hibit)
+    local d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+    local d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+    local d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+    local d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+    local d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+    local c = d0 >> 26; h0 = d0 & M26
+    d1 = d1 + c; c = d1 >> 26; h1 = d1 & M26
+    d2 = d2 + c; c = d2 >> 26; h2 = d2 & M26
+    d3 = d3 + c; c = d3 >> 26; h3 = d3 & M26
+    d4 = d4 + c; c = d4 >> 26; h4 = d4 & M26
+    h0 = h0 + c * 5; c = h0 >> 26; h0 = h0 & M26
+    h1 = h1 + c
+  end
+  -- réduction finale modulo 2^130 - 5
+  local c = h1 >> 26; h1 = h1 & M26
+  h2 = h2 + c; c = h2 >> 26; h2 = h2 & M26
+  h3 = h3 + c; c = h3 >> 26; h3 = h3 & M26
+  h4 = h4 + c; c = h4 >> 26; h4 = h4 & M26
+  h0 = h0 + c * 5; c = h0 >> 26; h0 = h0 & M26
+  h1 = h1 + c
+  local g0 = h0 + 5; c = g0 >> 26; g0 = g0 & M26
+  local g1 = h1 + c; c = g1 >> 26; g1 = g1 & M26
+  local g2 = h2 + c; c = g2 >> 26; g2 = g2 & M26
+  local g3 = h3 + c; c = g3 >> 26; g3 = g3 & M26
+  local g4 = h4 + c - (1 << 26)
+  if g4 >= 0 then h0, h1, h2, h3, h4 = g0, g1, g2, g3, g4 end
+  -- h modulo 2^128, puis + s
+  local f0 = (h0 | (h1 << 26)) & M32
+  local f1 = ((h1 >> 6) | (h2 << 20)) & M32
+  local f2 = ((h2 >> 12) | (h3 << 14)) & M32
+  local f3 = ((h3 >> 18) | (h4 << 8)) & M32
+  local p0, p1, p2, p3 = unpack("<I4I4I4I4", key, 17)
+  f0 = f0 + p0
+  f1 = f1 + p1 + (f0 >> 32)
+  f2 = f2 + p2 + (f1 >> 32)
+  f3 = f3 + p3 + (f2 >> 32)
+  return pack("<I4I4I4I4", f0 & M32, f1 & M32, f2 & M32, f3 & M32)
+end
+
+local function pad16(s) return string.rep("\0", (16 - #s % 16) % 16) end
+
+local function tag_aead(key, nonce, aad, ct)
+  local otk = C.bloc(key, 0, nonce):sub(1, 32)
+  return C.poly1305(otk, aad .. pad16(aad) .. ct .. pad16(ct) .. pack("<I8I8", #aad, #ct))
+end
+
+-- AEAD ChaCha20-Poly1305 (RFC 8439, §2.8) : renvoie chiffré, tag
+function C.aead_chiffrer(key, nonce, aad, clair)
+  local ct = C.chacha20(key, 1, nonce, clair)
+  return ct, tag_aead(key, nonce, aad, ct)
+end
+
+-- Renvoie le clair, ou nil si le tag est faux (QR modifié ou mauvaise clé)
+function C.aead_dechiffrer(key, nonce, aad, ct, tag)
+  local t = tag_aead(key, nonce, aad, ct)
+  local diff = 0
+  for i = 1, 16 do diff = diff | (t:byte(i) ~ (tag:byte(i) or 0)) end
+  if diff ~= 0 or #tag ~= 16 then return nil end
+  return C.chacha20(key, 1, nonce, ct)
+end
+
+-- ===== Sous-clés dérivées (étiquettes de 12 octets)
+-- Identifiant public de la clé (3 octets) : ne révèle rien de la clé.
+function C.id_cle(key) return C.bloc(key, 0, "QCM-keyid-v1"):sub(1, 3) end
+
+-- Nonce déterministe : CBC-MAC (bloc ChaCha20 comme PRF) de  longueur | données
+function C.nonce(key, data)
+  local kn = C.bloc(key, 0, "QCM-nonce-v1"):sub(1, 32)
+  local m = pack("<I8", #data) .. data
+  m = m .. pad16(m)
+  local st = string.rep("\0", 16)
+  for i = 1, #m, 16 do
+    local x = xor(st, m:sub(i, i + 15))
+    st = C.bloc(kn, (unpack("<I4", x)), x:sub(5, 16)):sub(1, 16)
+  end
+  return st:sub(1, 12)
+end
+
+-- ===== base64url (sans « = »)
+local B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+function C.b64(s)
+  local out = {}
+  for i = 1, #s, 3 do
+    local a, b, c = s:byte(i, i + 2)
+    local n = (a << 16) | ((b or 0) << 8) | (c or 0)
+    local k = (b and (c and 4 or 3)) or 2
+    for j = 1, k do
+      local v = (n >> (24 - 6 * j)) & 63
+      out[#out + 1] = B64:sub(v + 1, v + 1)
+    end
+  end
+  return table.concat(out)
+end
+
+function C.b64dec(t)
+  t = t:gsub("=", ""):gsub("+", "-"):gsub("/", "_")   -- accepte aussi le base64 standard
+  if t:find("[^%w%-_]") or #t % 4 == 1 then return nil end
+  local out, n, bits = {}, 0, 0
+  for i = 1, #t do
+    n = ((n << 6) | (B64:find(t:sub(i, i), 1, true) - 1)) & 0xffffff
+    bits = bits + 6
+    if bits >= 8 then
+      bits = bits - 8
+      out[#out + 1] = string.char((n >> bits) & 255)
+    end
+  end
+  return table.concat(out)
+end
+
+-- ===== Contenu du QR
+-- reponses : table de 10 lettres « A ».. « D » ; nom : chaîne UTF-8
+function C.chiffrer_qr(key, nom, reponses)
+  assert(#key == 32 and #reponses == 10)
+  local n = 0
+  for i = 1, 10 do n = (n << 2) | (reponses[i]:byte() - 65) end
+  local clair = pack(">I3", n << 4) .. nom
+  local aad = string.char(C.VERSION) .. C.id_cle(key)
+  local nonce = C.nonce(key, aad .. clair)
+  local ct, tag = C.aead_chiffrer(key, nonce, aad, clair)
+  return C.b64(aad .. nonce .. ct .. tag)
+end
+
+-- Renvoie nom, reponses (table de 10 lettres) ; ou nil, message d'erreur
+function C.dechiffrer_qr(key, texte)
+  local bin = C.b64dec((texte or ""):gsub("%s", ""))
+  if not bin or #bin < 4 + 12 + 3 + 16 then return nil, "ce n'est pas un QR de QCM chiffré" end
+  if bin:byte(1) ~= C.VERSION then return nil, "version de QR inconnue" end
+  local aad = bin:sub(1, 4)
+  if aad:sub(2, 4) ~= C.id_cle(key) then return nil, "ce QR a été produit avec une autre clé (autre lot)" end
+  local clair = C.aead_dechiffrer(key, bin:sub(5, 16), aad, bin:sub(17, -17), bin:sub(-16))
+  if not clair then return nil, "QR modifié ou falsifié (authentification refusée)" end
+  local n = unpack(">I3", clair) >> 4
+  local rep = {}
+  for i = 10, 1, -1 do rep[i] = string.char(65 + (n & 3)); n = n >> 2 end
+  return clair:sub(4), rep
+end
+
+-- ===== Fichier de clé : une ligne « QCMKEY1:<clé en base64url>:<nom du lot> »
+-- (les lignes vides ou commençant par # sont ignorées ; la clé seule est acceptée)
+function C.lire_texte_cle(ligne)
+  ligne = ligne:gsub("^\239\187\191", ""):gsub("^%s+", ""):gsub("%s+$", "")
+  local b, lot = ligne:match("^QCMKEY1:([%w%-_]+):?(.*)$")
+  if not b then b, lot = ligne:match("^([%w%-_]+)$"), "" end
+  local key = b and C.b64dec(b)
+  if not key or #key ~= 32 then return nil, "clé invalide (attendu : QCMKEY1:<43 caractères>:<nom du lot>)" end
+  return key, lot
+end
+
+function C.lire_fichier_cle(chemin)
+  local f = io.open(chemin, "rb")
+  if not f then return nil, "fichier de clé introuvable : " .. chemin end
+  local txt = f:read("a"); f:close()
+  for ligne in txt:gmatch("[^\r\n]+") do
+    if not ligne:match("^%s*#") and not ligne:match("^%s*$") then return C.lire_texte_cle(ligne) end
+  end
+  return nil, "fichier de clé vide : " .. chemin
+end
+
+function C.texte_cle(key, lot) return "QCMKEY1:" .. C.b64(key) .. ":" .. (lot or "") end
+
+return C
+\end{filecontents*}
+
+%% ------------------------- Générateur (code Lua) ----------------------------
+\begin{filecontents*}[overwrite]{qcm_generateur.lua}
+-- ===== Générateur pseudo-aléatoire reproductible (indépendant de la version de Lua)
+local M = 2147483647
+local state = 1
+
+local function trim(s) return (s:gsub("^%s+", ""):gsub("%s+$", "")) end
+
+-- Hash très simple : djb2 (h <- 33*h + octet) modulo 2^31-1. Résultat dans [1, 2^31-2].
+-- C'est CE nombre (affiché en 8 chiffres hexadécimaux) qui sert de graine.
+local function hash(s)
+  local h = 5381
+  for i = 1, #s do h = (h * 33 + s:byte(i)) % M end
+  if h == 0 then h = 1 end
+  return h
+end
+
+local function seed(h)
+  state = h
+  for i = 1, 40 do state = (state * 48271) % M end   -- échauffement
+end
+
+local function rnd(a, b)                              -- entier uniforme dans [a,b]
+  state = (state * 48271) % M
+  return a + math.floor((state / M) * (b - a + 1))
+end
+
+local function shuffle(t)
+  for i = #t, 2, -1 do
+    local j = rnd(1, i)
+    t[i], t[j] = t[j], t[i]
+  end
+  return t
+end
+
+local function pick(t) return t[rnd(1, #t)] end
+
+local function powmod(b, e, m)
+  local r = 1
+  b = b % m
+  while e > 0 do
+    if e % 2 == 1 then r = (r * b) % m end
+    b = (b * b) % m
+    e = math.floor(e / 2)
+  end
+  return r
+end
+
+-- écrit  A*L + B  (ex. lin(2,-1,"q") -> "2q-1")
+local function lin(A, B, L)
+  local s
+  if A == 0 then s = "" elseif A == 1 then s = L
+  elseif A == -1 then s = "-" .. L else s = A .. L end
+  if B > 0 then
+    s = (s == "") and tostring(B) or (s .. "+" .. B)
+  elseif B < 0 then
+    s = s .. B
+  elseif s == "" then
+    s = "0"
+  end
+  return s
+end
+
+-- ===== Construction des 4 choix : 1 bonne réponse + 3 distracteurs
+-- Un candidat est une chaîne, ou {s=chaîne, ok=vrai} si le candidat est
+-- mathématiquement valide (il est alors écarté : unicité de la bonne réponse).
+local function make(correct, plaus, filler)
+  local seen = { [correct] = true }
+  local picks = {}
+  local function take(list)
+    shuffle(list)
+    for _, c in ipairs(list) do
+      if #picks == 3 then return end
+      local s, ok = c, false
+      if type(c) == "table" then s, ok = c.s, c.ok end
+      if (not ok) and (not seen[s]) then
+        seen[s] = true
+        picks[#picks + 1] = s
+      end
+    end
+  end
+  take(plaus)
+  take(filler)
+  assert(#picks == 3, "pas assez de distracteurs")
+  local opts = { correct, picks[1], picks[2], picks[3] }
+  shuffle(opts)
+  local idx
+  for i, s in ipairs(opts) do if s == correct then idx = i end end
+  return opts, idx
+end
+
+-- ===== Les 10 questions (chacune est paramétrée par la graine)
+
+-- 1. Division euclidienne directe
+local function Q1()
+  local b = rnd(12, 59)
+  local q = rnd(18, 70)
+  local r = rnd(2, b - 2)
+  local a = b * q + r
+  local function P(qq, rr)
+    return { s = string.format("$q=%d$ et $r=%d$", qq, rr),
+             ok = (qq * b + rr == a and rr >= 0 and rr < b) }
+  end
+  return {
+    stem = string.format("Dans la division euclidienne de $%d$ par $%d$, le quotient et le reste sont :", a, b),
+    correct = P(q, r).s,
+    plaus = { P(q+1, r-b), P(q-1, r+b), P(q, b-r), P(q+1, r), P(q-2, r+2*b), P(q, r+1) },
+    filler = { P(q+2, r-2*b), P(q-1, r), P(q+1, b-r), P(q, r-1) } }
+end
+
+-- 2. Égalité donnée qui n'est PAS une division euclidienne (reste >= diviseur)
+local function Q2()
+  local b = rnd(7, 45)
+  local k = rnd(1, 3)
+  local r = rnd(1, b - 1)
+  local q0 = rnd(8, 40)
+  local r0 = b * k + r
+  local a = b * q0 + r0
+  local function P(qq, rr)
+    return { s = string.format("$q=%d$ et $r=%d$", qq, rr),
+             ok = (qq * b + rr == a and rr >= 0 and rr < b) }
+  end
+  return {
+    stem = string.format("On a $%d=%d\\times %d+%d$. Le quotient et le reste de la division euclidienne de $%d$ par $%d$ sont :", a, q0, b, r0, a, b),
+    correct = P(q0 + k, r).s,
+    plaus = { P(q0, r0), P(q0+k+1, r-b), P(q0+k-1, r+b), P(q0+1, r0-b), P(q0+k, r0) },
+    filler = { P(q0+k+2, r-2*b), P(q0+k-2, r+2*b), P(q0+k, b-r), P(q0+k+1, r) } }
+end
+
+-- 3. Division d'un entier NÉGATIF (le reste doit rester positif)
+local function Q3()
+  local b = rnd(11, 59)
+  local q = rnd(5, 40)
+  local r = rnd(2, b - 2)
+  local a = b * q + r
+  local function P(qq, rr)
+    return { s = string.format("$q=%d$ et $r=%d$", qq, rr),
+             ok = (qq * b + rr == -a and rr >= 0 and rr < b) }
+  end
+  return {
+    stem = string.format("On a $%d=%d\\times %d+%d$. Le quotient et le reste de la division euclidienne de $-%d$ par $%d$ sont :", a, b, q, r, a, b),
+    correct = P(-q - 1, b - r).s,
+    plaus = { P(-q, -r), P(-q, r), P(-q-1, r), P(-q, b-r), P(-q-2, 2*b-r) },
+    filler = { P(-q-1, -r), P(-q+1, r-b), P(-q-2, b-r), P(-q-1, r-b) } }
+end
+
+-- 4. Congruences : laquelle est vraie ?
+local function Q4()
+  local n = rnd(6, 13)
+  local a = rnd(30, 400)
+  local t = a % n
+  local js = { -1, 0, 1, 2 }
+  local function C(v)
+    return { s = string.format("$%d\\equiv %d\\ [%d]$", a, v, n), ok = ((a - v) % n == 0) }
+  end
+  local plaus = {}
+  for _, d in ipairs({ 1, -1, 2, -2 }) do plaus[#plaus + 1] = C(t + d + n * pick(js)) end
+  plaus[#plaus + 1] = C(-t)
+  return {
+    stem = "Laquelle de ces congruences est vraie ?",
+    correct = C(t + n * pick(js)).s,
+    plaus = plaus,
+    filler = { C(t + 3), C(t - 3), C(t + n + 3), C(t - n - 3), C(t + 4) } }
+end
+
+-- 5. Division de k*n par b, connaissant quotient (q) et reste (r) de n par b
+local function Q5()
+  local b = rnd(6, 15)
+  local k = rnd(2, 4)
+  local r
+  repeat r = rnd(2, b - 1) until k * r >= b and (k * r) % b ~= 0
+  local c = math.floor(k * r / b)
+  local s = (k * r) % b
+  local function O(B, rem) return string.format("$%s$ et $%d$", lin(k, B, "q"), rem) end
+  return {
+    stem = string.format("Dans la division euclidienne de $n$ par $%d$, le quotient est $q$ et le reste est $%d$. La division euclidienne de $%dn$ par $%d$ a pour quotient et reste :", b, r, k, b),
+    correct = O(c, s),
+    plaus = { O(0, k*r), O(0, s), O(c, k*r), O(c+1, s-b), O(c, r), O(c-1, s+b) },
+    filler = { O(c+1, s), O(c-1, s), O(c+2, s-2*b), O(c, s+1) } }
+end
+
+-- 6. Reste d'un produit modulo p
+local function Q6()
+  local p = rnd(5, 13)
+  local ra, rb
+  repeat ra = rnd(2, p - 1); rb = rnd(2, p - 1) until ra * rb >= p and (ra * rb) % p ~= 0
+  local m = (ra * rb) % p
+  local function R(v) return { s = string.format("$%d$", v), ok = (v == m) } end
+  local filler = {}
+  for v = 0, p - 1 do filler[#filler + 1] = R(v) end
+  filler[#filler + 1] = R(p + 1)
+  return {
+    stem = string.format("Soient $a=%dq+%d$ et $b=%dq'+%d$ avec $q,q'\\in\\mathbb Z$. Le reste de la division euclidienne de $ab$ par $%d$ est :", p, ra, p, rb, p),
+    correct = R(m).s,
+    plaus = { R(ra * rb), R((ra + rb) % p), R(ra + rb), R((m + 1) % p), R((m - 1) % p), R(ra * rb - p) },
+    filler = filler }
+end
+
+-- 7. Division d'une expression en a (symbolique), lettres variables
+local function Q7()
+  local sets = { { "a", "b", "q", "r" }, { "n", "d", "q", "r" }, { "x", "m", "k", "s" } }
+  local L = pick(sets)
+  local a, b, q, r = L[1], L[2], L[3], L[4]
+  local T = rnd(1, 4)
+  local tgt, B
+  if T == 1 then tgt = "-" .. a; B = -1
+  elseif T == 2 then tgt = b .. "-" .. a; B = 0
+  elseif T == 3 then tgt = "2" .. b .. "-" .. a; B = 1
+  else tgt = "-" .. a .. "-" .. b; B = -2 end
+  local good, neg, two, pos = b .. "-" .. r, "-" .. r, "2" .. b .. "-" .. r, r
+  local function O(BB, rem) return string.format("$%s$ et $%s$", lin(-1, BB, q), rem) end
+  return {
+    stem = string.format("Soit $%s=%s%s+%s$ la division euclidienne de l'entier $%s$ par l'entier naturel $%s$, avec $0<%s<%s$. Le quotient et le reste de la division euclidienne de $%s$ par $%s$ sont :", a, b, q, r, a, b, r, b, tgt, b),
+    correct = O(B, good),
+    plaus = { O(B+1, neg), O(B, neg), O(B-1, two), O(B, pos), O(B+1, good), O(B-1, good) },
+    filler = { O(B+1, pos), O(B-1, neg), O(B+2, neg), O(B-2, two) } }
+end
+
+-- 8. Chiffre des unités de m^N
+local function Q8()
+  local m = pick({ 2, 3, 7, 8 })
+  local N = rnd(1001, 3998)
+  local d = powmod(m, N, 10)
+  local function D(v) return { s = string.format("$%d$", v), ok = (v == d) } end
+  local plaus, filler = {}, {}
+  for i = 1, 4 do plaus[#plaus + 1] = D(powmod(m, i, 10)) end
+  for v = 0, 9 do filler[#filler + 1] = D(v) end
+  return {
+    stem = string.format("Le chiffre des unités de $%d^{%d}$ est :", m, N),
+    correct = D(d).s, plaus = plaus, filler = filler }
+end
+
+-- 9. Équation a x = c [p] (p premier : solution unique modulo p)
+local function Q9()
+  local p = pick({ 5, 7, 11, 13, 17 })
+  local a, c, x0
+  repeat
+    a = rnd(2, p - 1); c = rnd(1, p - 1); x0 = nil
+    for x = 0, p - 1 do if (a * x - c) % p == 0 then x0 = x end end
+  until x0 ~= nil and x0 ~= c
+  local function X(v)
+    v = v % p
+    return { s = string.format("$x\\equiv %d\\ [%d]$", v, p), ok = ((a * v - c) % p == 0) }
+  end
+  local filler = {}
+  for v = 0, p - 1 do filler[#filler + 1] = X(v) end
+  return {
+    stem = string.format("L'ensemble des entiers $x$ tels que $%dx\\equiv %d\\ [%d]$ est :", a, c, p),
+    correct = X(x0).s,
+    plaus = { X(c * a), X(c - a), X(p - x0), X(c), X(x0 + 1), X(x0 - 1) },
+    filler = filler }
+end
+
+-- 10. n+k divise n^2+c : somme des solutions
+local function Q10()
+  local k, c, M, sols
+  for try = 1, 1000 do
+    k = rnd(2, 7); c = rnd(1, 16)
+    if c % k ~= 0 then                 -- n = 0 n'est pas solution : pas d'ambiguïté sur N
+      M = k * k + c
+      sols = {}
+      for d = k, M do if M % d == 0 then sols[#sols + 1] = d - k end end
+      if #sols >= 2 then break end
+    end
+    sols = nil
+  end
+  assert(sols, "Q10 : aucun paramètre convenable")
+  local S, sumd, alld = 0, 0, 0
+  for _, n in ipairs(sols) do S = S + n; sumd = sumd + n + k end
+  for d = 1, M do if M % d == 0 then alld = alld + (d - k) end end
+  local function N(v) return { s = string.format("$%d$", v), ok = (v == S) } end
+  local plaus, filler = {}, {}
+  for _, n in ipairs(sols) do if S - n > 0 then plaus[#plaus + 1] = N(S - n) end end
+  if sumd > 0 then plaus[#plaus + 1] = N(sumd) end
+  if alld > 0 then plaus[#plaus + 1] = N(alld) end
+  for _, dv in ipairs({ 1, -1, 2, -2, 3, -3, 4, 5 }) do
+    if S + dv > 0 then filler[#filler + 1] = N(S + dv) end
+  end
+  return {
+    stem = string.format("La somme des entiers naturels $n$ tels que $n+%d$ divise $n^2+%d$ est :", k, c),
+    correct = N(S).s, plaus = plaus, filler = filler }
+end
+
+local gens = { Q1, Q2, Q3, Q4, Q5, Q6, Q7, Q8, Q9, Q10 }
+
+-- ===== Construction d'une copie à partir de son hash (seul le hash compte)
+local letters = { "A", "B", "C", "D" }
+
+local function build(h)
+  seed(h)
+  local copy = {}
+  for i, g in ipairs(gens) do
+    local Q = g()
+    local opts, idx = make(Q.correct, Q.plaus, Q.filler)
+    copy[i] = { stem = Q.stem, opts = opts, idx = idx }
+  end
+  return copy
+end
+
+-- Clé de réponses (liste de 10 lettres) à partir du hash : utilisée par corriger.lua
+function cle(h)
+  local ans = {}
+  for i, Qc in ipairs(build(h)) do ans[i] = letters[Qc.idx] end
+  return ans
+end
+
+function hash_nom(name, salt) return hash(salt .. "|" .. trim(name)) end
+
+-- ===== Sorties TeX
+local results = {}
+local used = {}
+
+local function esc(s)
+  return (s:gsub("([&%%$#_{}])", "\\%1"))
+end
+
+-- ===== Clé secrète du lot (lue dans \FichierCle ; jamais écrite dans le PDF)
+local CLE
+
+function qcm_charger_cle(fichier)
+  local chemin = (kpse and kpse.find_file(fichier)) or fichier
+  local key, err = qcm_chiffre.lire_fichier_cle(chemin)
+  if not key then
+    error("\n\n*** QCM : " .. err .. "\n" ..
+          "*** Créer la clé du lot :  texlua corriger.lua --nouvelle-cle \"NOM-DU-LOT\"\n" ..
+          "*** ou, depuis l'application Android : Lots > Nouvelle clé > Partager,\n" ..
+          "*** puis coller la ligne QCMKEY1:... dans le fichier " .. fichier .. "\n", 0)
+  end
+  CLE = key
+  texio.write_nl("term and log", "QCM : clé du lot chargée (id " ..
+    string.format("%02x%02x%02x", qcm_chiffre.id_cle(key):byte(1, 3)) .. ")")
+end
+
+-- ===== Zone de réponses lue par l'application Android.
+-- Géométrie en millimètres, origine en haut à gauche de la zone. NE PAS MODIFIER
+-- sans modifier aussi l'application (fichier Zone.kt) : 4 carrés noirs de repérage
+-- aux coins, 10 colonnes x 4 lignes de cases, QR à droite.
+local Z = { W = 178, H = 42,            -- taille de la zone
+            fid = 5,                    -- côté des carrés de repérage (collés aux coins)
+            x0 = 24, dx = 11,           -- centre de la colonne 1, pas horizontal
+            y0 = 12, dy = 7.5,          -- centre de la ligne A, pas vertical
+            box = 5.5,                  -- côté d'une case
+            qr = 28, qrx = 155, qry = 21 }  -- côté et centre du QR
+
+local function zone(answers, prof)
+  local p = {}
+  local function put(x, y, s)           -- (x, y) depuis le coin haut gauche
+    p[#p + 1] = string.format("\\put(%.2f,%.2f){%s}", x, Z.H - y, s)
+  end
+  local carre = string.format("\\rule{%gmm}{%gmm}", Z.fid, Z.fid)
+  put(0, Z.fid, carre); put(Z.W - Z.fid, Z.fid, carre)
+  put(0, Z.H, carre);   put(Z.W - Z.fid, Z.H, carre)
+  for j = 1, 10 do
+    put(Z.x0 + (j - 1) * Z.dx, 4.5, "\\makebox(0,0){\\textbf{" .. j .. "}}")
+  end
+  for i, L in ipairs(letters) do
+    local y = Z.y0 + (i - 1) * Z.dy
+    put(14, y, "\\makebox(0,0){\\textbf{" .. L .. "}}")
+    for j = 1, 10 do
+      local x = Z.x0 + (j - 1) * Z.dx
+      if prof and answers[j] == L then
+        put(x - Z.box / 2, y + Z.box / 2,
+            string.format("\\textcolor{ok}{\\rule{%gmm}{%gmm}}", Z.box, Z.box))
+      end
+      put(x - Z.box / 2, y + Z.box / 2, string.format("\\framebox(%g,%g){}", Z.box, Z.box))
+    end
+  end
+  put(Z.qrx, Z.qry, "\\makebox(0,0){\\box\\QCMqr}")
+  return p                              -- une commande \put par ligne
+end
+
+function questions(name, salt, prof)
+  name = trim(name)
+  local h = hash(salt .. "|" .. name)
+  local hx = string.format("%08x", h)
+  if used[h] == name then
+    texio.write_nl("term and log", "!!! ATTENTION : nom en double : " .. name)
+  elseif used[h] then
+    texio.write_nl("term and log", "!!! ATTENTION : collision de hash entre '" .. used[h] .. "' et '" .. name .. "' : changer \\Graine")
+  end
+  used[h] = name
+
+  local copy = build(h)
+  local answers = {}
+  for i, Qc in ipairs(copy) do
+    answers[i] = letters[Qc.idx]
+    local cells = {}
+    for j, s in ipairs(Qc.opts) do
+      if prof and j == Qc.idx then s = "{\\setlength{\\fboxsep}{1pt}\\colorbox{okbg}{" .. s .. "}}" end
+      cells[j] = "{" .. s .. "}"
+    end
+    tex.print("\\question{" .. Qc.stem .. "}" .. table.concat(cells))
+  end
+
+  -- QR chiffré = nom (UTF-8) + 10 bonnes réponses ; rien n'est écrit en clair.
+  -- Composé dans une boîte, hors de tout argument, car le texte contient « _ ».
+  local qr = qcm_chiffre.chiffrer_qr(CLE, name, answers)
+  tex.print("\\vfill")
+  tex.print("\\setbox\\QCMqr=\\hbox{\\qrcode[height=" .. Z.qr .. "mm]{" .. qr .. "}}%")
+  tex.print("\\noindent\\begingroup\\setlength{\\unitlength}{1mm}\\linethickness{0.35mm}%")
+  tex.print(string.format("\\begin{picture}(%g,%g)", Z.W, Z.H))
+  tex.print(zone(answers, prof))
+  tex.print("\\end{picture}\\endgroup")
+  results[#results + 1] = { esc(name), hx, table.concat(answers, " ") }
+end
+
+function resume()
+  tex.print("\\clearpage")
+  tex.print("{\\large\\bfseries Récapitulatif des réponses}\\par\\vspace{0.8em}")
+  tex.print("\\begin{longtable}{@{}p{0.38\\linewidth}ll@{}}")
+  tex.print("\\textbf{Nom} & \\textbf{Hash} & \\textbf{Réponses (questions 1 à 10)}\\\\\\hline\\endhead")
+  for _, rr in ipairs(results) do
+    tex.print(rr[1] .. " & \\texttt{" .. rr[2] .. "} & " .. rr[3] .. "\\\\")
+  end
+  tex.print("\\end{longtable}")
+end
+\end{filecontents*}
+
+\begin{filecontents*}[overwrite]{corriger.lua}
+-- ============================================================================
+--  corriger.lua : nom, clé de réponses et note à partir du texte du QR code
+--  Le QR est chiffré (ChaCha20-Poly1305) avec la clé secrète du lot, lue dans
+--  qcm_cle.txt (même dossier que ce script) ou dans le fichier donné par --cle.
+--
+--  Prérequis : texlua (fourni avec TeX Live) ou n'importe quel Lua 5.3/5.4,
+--  et les fichiers qcm_chiffre.lua / qcm_generateur.lua (créés à la compilation
+--  du .tex) dans le même dossier que ce script.
+--
+--  Utilisation :
+--    texlua corriger.lua --nouvelle-cle "DS1-2026"     -> crée qcm_cle.txt (clé aléatoire)
+--    texlua corriger.lua "TEXTE_DU_QR"                 -> nom + clé de réponses
+--    texlua corriger.lua "TEXTE_DU_QR" ABACBBDA.D      -> nom + clé + note sur 10
+--    texlua corriger.lua --csv lecture.csv             -> "nom,note" pour chaque ligne "QR,réponses"
+--    texlua corriger.lua --cle autre_cle.txt ...       -> utiliser un autre fichier de clé
+--    texlua corriger.lua --hash "Alice Martin" DS1-2026  -> hash (graine) d'un nom
+--    texlua corriger.lua --autotest                    -> vérifie le chiffrement (vecteurs RFC 8439)
+--
+--  Réponses de l'élève : 10 caractères parmi A B C D. Tout autre caractère
+--  (point, tiret, ?, espace, X...) = pas de réponse (0 point, pas de pénalité).
+--  Plusieurs cases cochées sur une même question : à signaler par un autre
+--  caractère (ex. « * ») = 0 point.
+--
+--  Anciens formats encore acceptés : « Nom|A B A C ... » (en clair) et
+--  « Nom|55de8db4 » ou « 55de8db4 » (hash : la clé de réponses est recalculée).
+-- ============================================================================
+local dir = (arg and arg[0] and arg[0]:match("^(.*)[/\\]")) or "."
+local X = dofile(dir .. "/qcm_chiffre.lua")
+
+local args = { table.unpack(arg) }
+local fichier_cle = dir .. "/qcm_cle.txt"
+if args[1] == "--cle" then
+  fichier_cle = args[2] or ""
+  table.remove(args, 1); table.remove(args, 1)
+end
+
+local function echec(msg) io.stderr:write(msg .. "\n"); os.exit(1) end
+
+local cle_secrete
+local function cle_du_lot()
+  if not cle_secrete then
+    local err
+    cle_secrete, err = X.lire_fichier_cle(fichier_cle)
+    if not cle_secrete then echec(err) end
+  end
+  return cle_secrete
+end
+
+-- Renvoie nom, liste des 10 lettres de la clé de réponses ; ou nil, erreur.
+local function lire_qr(qr)
+  qr = (qr or ""):gsub("^%s+", ""):gsub("%s+$", "")
+  if not qr:find("|", 1, true) and not qr:match("^%x%x%x%x%x%x%x%x$") then
+    return X.dechiffrer_qr(cle_du_lot(), qr)              -- QR chiffré
+  end
+  local nom, fin = qr:match("^(.-)|?([^|]*)$")            -- anciens formats en clair
+  local compact = (fin:gsub("%s", "")):upper()
+  if #compact == 10 and compact:match("^[ABCD]+$") then
+    local c = {}
+    for i = 1, 10 do c[i] = compact:sub(i, i) end
+    return nom, c
+  end
+  local h = tonumber(compact, 16)
+  if not h or h < 1 or h >= 2147483647 then return nil, "QR illisible" end
+  dofile(dir .. "/qcm_generateur.lua")
+  return nom, cle(h)
+end
+
+local function note(cle, rep)
+  rep = (rep or ""):gsub("%s", ""):upper()
+  local n, faux = 0, {}
+  for i = 1, #cle do
+    local r = rep:sub(i, i)
+    if r == cle[i] then n = n + 1
+    elseif r:match("[ABCD]") then faux[#faux + 1] = string.format("Q%d: %s (attendu %s)", i, r, cle[i]) end
+  end
+  return n, faux
+end
+
+local function hex(s) return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end)) end
+local function unhex(s) return (s:gsub("%s", ""):gsub("%x%x", function(h) return string.char(tonumber(h, 16)) end)) end
+
+if args[1] == "--hash" then
+  dofile(dir .. "/qcm_generateur.lua")
+  print(string.format("%08x", hash_nom(args[2] or "", args[3] or "")))
+
+elseif args[1] == "--nouvelle-cle" then
+  local lot = args[2] or ""
+  if lot:find("[\r\n]") then echec("nom de lot invalide") end
+  local sortie = args[3] or fichier_cle
+  local f = io.open(sortie, "rb")
+  if f then f:close(); echec("Le fichier " .. sortie .. " existe déjà : le supprimer ou le renommer d'abord.") end
+  local u = io.open("/dev/urandom", "rb")
+  local key = u and u:read(32)
+  if u then u:close() end
+  if not key or #key ~= 32 then
+    echec("Pas de source d'aléa sûre sur ce système (/dev/urandom absent).\n" ..
+          "Créer la clé avec l'application Android (Lots > Nouvelle clé > Partager)\n" ..
+          "et coller la ligne QCMKEY1:... dans " .. sortie)
+  end
+  f = assert(io.open(sortie, "wb"))
+  f:write("# Clé secrète du lot : NE PAS DIFFUSER (ni aux élèves, ni dans un dépôt public).\n")
+  f:write(X.texte_cle(key, lot) .. "\n")
+  f:close()
+  print("Clé créée dans " .. sortie .. " (id " .. hex(X.id_cle(key)) .. ").")
+  print("À importer dans l'application Android (Lots > Importer une clé) : copier la ligne QCMKEY1:...")
+
+elseif args[1] == "--autotest" then
+  local function verif(nomtest, obtenu, attendu)
+    if obtenu ~= unhex(attendu) then echec("ÉCHEC " .. nomtest .. " : " .. hex(obtenu)) end
+    print("ok  " .. nomtest)
+  end
+  -- RFC 8439 §2.3.2 (bloc), §2.5.2 (Poly1305), §2.8.2 (AEAD)
+  local k = unhex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")
+  verif("bloc ChaCha20", X.bloc(k, 1, unhex("000000090000004a00000000")),
+    "10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4e" ..
+    "d2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")
+  verif("Poly1305", X.poly1305(unhex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"),
+    "Cryptographic Forum Research Group"), "a8061dc1305136c6c22b8baf0c0127a9")
+  local key = unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+  local nonce, aad = unhex("070000004041424344454647"), unhex("50515253c0c1c2c3c4c5c6c7")
+  local clair = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+  local ct, tag = X.aead_chiffrer(key, nonce, aad, clair)
+  verif("AEAD chiffré", ct,
+    "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b" ..
+    "1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc" ..
+    "3ff4def08e4b7a9de576d26586cec64b6116")
+  verif("AEAD tag", tag, "1ae10b594f09e26a7e902ecbd0600691")
+  assert(X.aead_dechiffrer(key, nonce, aad, ct, tag) == clair)
+  assert(X.aead_dechiffrer(key, nonce, aad, ct:sub(1, 5) .. "x" .. ct:sub(7), tag) == nil)
+  local rep = { "A", "D", "A", "B", "A", "C", "C", "D", "D", "C" }
+  local qr = X.chiffrer_qr(key, "Alain Térieur", rep)
+  local nom, r2 = X.dechiffrer_qr(key, qr)
+  assert(nom == "Alain Térieur" and table.concat(r2) == table.concat(rep))
+  assert(X.dechiffrer_qr(k, qr) == nil)
+  print("ok  aller-retour QR (" .. #qr .. " caractères)")
+
+elseif args[1] == "--csv" then
+  for ligne in io.lines(args[2]) do
+    local qr, rep = ligne:match("^%s*([^,;]-)%s*[,;]%s*(.-)%s*$")
+    if qr and qr ~= "" then
+      local nom, c = lire_qr(qr)
+      if nom then print(string.format("%s,%d", nom, (note(c, rep))))
+      else print(string.format("ERREUR (%s),", c)) end
+    end
+  end
+
+else
+  if not args[1] then echec("Mode d'emploi : voir l'en-tête de corriger.lua") end
+  local nom, c = lire_qr(args[1])
+  if not nom then echec("Erreur : " .. c) end
+  print("Nom : " .. nom)
+  print("Clé : " .. table.concat(c, " "))
+  if args[2] then
+    local n, faux = note(c, args[2])
+    print(string.format("Note : %d/10", n))
+    for _, f in ipairs(faux) do print("  " .. f) end
+  end
+end
+\end{filecontents*}
+
+\newbox\QCMqr   % boîte du QR (composé hors de tout argument : le texte contient « _ »)
+\directlua{qcm_chiffre = dofile("qcm_chiffre.lua")
+           dofile("qcm_generateur.lua")
+           qcm_charger_cle("\luaescapestring{\FichierCle}")}
+
+%% -------------------------------- Mise en page ------------------------------
+%% Chaque copie doit tenir sur UNE page (sinon la zone de réponses est rejetée
+%% sur la page suivante) : avertissement dans le journal de compilation.
+\newcommand{\VerifierPage}{%
+  \ifnum\value{page}=\numexpr\value{copie}+1\relax\else
+    \directlua{texio.write_nl("term and log",
+      "!!! ATTENTION : une copie déborde sur plusieurs pages (avant la page \the\value{page})")}%
+  \fi}
+\newcommand{\Copie}[1]{%
+  \ifblank{#1}{}{%
+    \ifnum\value{copie}>0 \clearpage\fi
+    \VerifierPage
+    \stepcounter{copie}\setcounter{qn}{0}%
+    \noindent\textbf{Nom :}\ \textbf{#1}\ \leaders\hrule height 0.4pt depth 0pt\hfill\kern0pt\par
+    \directlua{questions("\luaescapestring{\detokenize{#1}}",
+                         "\luaescapestring{\detokenize\expandafter{\Graine}}",
+                         \ifdefined\PROF true\else false\fi)}%
+  }%
+}
+
+\begin{document}
+\renewcommand*{\do}[1]{\Copie{#1}}
+\expandafter\docsvlist\expandafter{\ListeDesNoms}
+\clearpage\VerifierPage
+\ifdefined\PROF\directlua{resume()}\fi
+\end{document}

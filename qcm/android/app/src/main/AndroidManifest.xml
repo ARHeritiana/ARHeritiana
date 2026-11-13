@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Aucune permission : la photo est prise par l'application Appareil photo du téléphone,
+         et rien n'est envoyé sur Internet. -->
+    <queries>
+        <intent><action android:name="android.media.action.IMAGE_CAPTURE" /></intent>
+    </queries>
+
+    <application
+        android:allowBackup="false"
+        android:icon="@drawable/icone"
+        android:label="QCM Scan"
+        android:largeHeap="true"
+        android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+
+        <activity android:name=".MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".LotActivity" android:exported="false" />
+        <activity android:name=".VerifActivity" android:exported="false"
+            android:screenOrientation="sensorLandscape" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fichiers"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS" android:resource="@xml/chemins" />
+        </provider>
+    </application>
+</manifest>

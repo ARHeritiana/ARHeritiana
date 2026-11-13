@@ -1,0 +1,17 @@
+# Clé secrète du lot : ne JAMAIS la publier
+qcm_cle.txt
+*_cle.txt
+# Fichiers produits par la compilation
+qcm_chiffre.lua
+qcm_generateur.lua
+corriger.lua
+*.aux
+*.log
+*.pdf
+# Android
+android/.gradle/
+android/build/
+android/*/build/
+android/local.properties
+android/.kotlin/
+livrables/
